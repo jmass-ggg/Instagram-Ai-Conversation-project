@@ -1,0 +1,47 @@
+# Environment variables — never commit real secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Pytest / Hypothesis
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+
+# Django
+db.sqlite3
+staticfiles/
+media/
+
+# Docker
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Node (if any frontend tooling is added later)
+node_modules/
