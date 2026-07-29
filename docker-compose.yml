@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: instagram_price_reply
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  django:
+    build:
+      context: ./django_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-secret}@db:5432/instagram_price_reply
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
+      CURRENCY_SYMBOL: ${CURRENCY_SYMBOL:-$}
+      GRAPH_API_VERSION: ${GRAPH_API_VERSION:-v19.0}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-key-change-in-prod}
+      DEBUG: ${DEBUG:-true}
+      INSTAGRAM_USER_ID: ${INSTAGRAM_USER_ID:-}
+      INSTAGRAM_USERNAME: ${INSTAGRAM_USERNAME:-}
+      INSTAGRAM_ACCESS_TOKEN: ${INSTAGRAM_ACCESS_TOKEN:-}
+      INSTAGRAM_PAGE_ID: ${INSTAGRAM_PAGE_ID:-}
+      INSTAGRAM_MEDIA_ID: ${INSTAGRAM_MEDIA_ID:-}
+      DEMO_PRODUCT_NAME: ${DEMO_PRODUCT_NAME:-Demo Product}
+      DEMO_PRODUCT_PRICE: ${DEMO_PRODUCT_PRICE:-9.99}
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py runserver 0.0.0.0:8000"
+
+  webhook:
+    build:
+      context: ./webhook_service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    depends_on:
+      - django
+    environment:
+      META_APP_SECRET: ${META_APP_SECRET}
+      META_VERIFY_TOKEN: ${META_VERIFY_TOKEN}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
+      DJANGO_INTERNAL_URL: ${DJANGO_INTERNAL_URL:-http://django:8000}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+
+volumes:
+  postgres_data:
