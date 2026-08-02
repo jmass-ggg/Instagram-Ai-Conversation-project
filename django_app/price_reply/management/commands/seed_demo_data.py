@@ -19,16 +19,16 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         # ── User ──────────────────────────────────────────────────────────────
-        user, created = User.objects.get_or_create(
-            username="demo_admin",
-            defaults={"email": "demo@example.com"},
-        )
-        if created:
-            user.set_password("demo_password")
-            user.save()
-            self.stdout.write(self.style.SUCCESS("Created user: demo_admin"))
-        else:
+        try:
+            user = User.objects.get(username="demo_admin")
             self.stdout.write("User already exists: demo_admin")
+        except User.DoesNotExist:
+            user = User.objects.create_user(
+                username="demo_admin",
+                email="demo@example.com",
+                password="demo_password",
+            )
+            self.stdout.write(self.style.SUCCESS("Created user: demo_admin"))
 
         # ── Business ──────────────────────────────────────────────────────────
         business, created = Business.objects.get_or_create(

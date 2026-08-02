@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 
+from django.db import transaction
 from django.utils import timezone as dj_timezone
 
 from .intent import is_price_inquiry
@@ -20,13 +21,15 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
     Orchestrate the full comment-to-reply pipeline.
 
     Steps:
-      1. Duplicate check — return existing record immediately if already seen
+      1. Duplicate / terminal check — skip if already processed to completion
       2. Resolve InstagramAccount — fail if missing or inactive
-      3. Price intent check — mark ignored if not a price inquiry
-      4. Resolve post mapping → product — fail if missing, inactive, or cross-business
-      5. Compose reply
-      6. Send private reply via Meta Graph API
-      7. Update ProcessedComment status to sent/failed
+      3. Atomic create-or-get ProcessedComment
+      4. Price intent check — mark ignored if not a price inquiry
+      5. Resolve post mapping → product — fail if missing, inactive, or cross-business
+      6. Compose reply and persist it BEFORE calling Meta
+      7. Send private reply via Meta Graph API
+      8. Handle "already replied" as idempotency, not failure
+      9. Update ProcessedComment status
     """
     comment_id = event_data["comment_id"]
     instagram_account_id = event_data["instagram_account_id"]
@@ -35,7 +38,7 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
     comment_text = event_data["comment_text"]
     timestamp = event_data["timestamp"]
 
-    # Normalise timestamp to a timezone-aware datetime for received_at
+    # Normalise timestamp
     if isinstance(timestamp, str):
         received_at = datetime.fromisoformat(timestamp)
         if received_at.tzinfo is None:
@@ -47,25 +50,28 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
     else:
         received_at = dj_timezone.now()
 
-    # ── 1. Duplicate check ────────────────────────────────────────────────────
-    # We need a placeholder account for the FK before we know the real one.
-    # Use get_or_create with a sentinel that we'll update after account lookup.
-    # Strategy: attempt to fetch first; only create if it doesn't exist yet.
+    # ── 1. Check for existing record ──────────────────────────────────────────
     try:
         existing = ProcessedComment.objects.get(instagram_comment_id=comment_id)
-        logger.info("Duplicate comment %s — returning existing record", comment_id)
-        return existing
+        if existing.is_terminal:
+            logger.info(
+                "Duplicate webhook for comment %s — already terminal (%s), skipping",
+                comment_id, existing.status,
+            )
+            return existing
+        # Non-terminal (received/failed) — fall through to reprocess
+        logger.info(
+            "Comment %s exists with status=%s — will attempt to reprocess",
+            comment_id, existing.status,
+        )
     except ProcessedComment.DoesNotExist:
-        pass
+        existing = None
 
     # ── 2. Resolve InstagramAccount ───────────────────────────────────────────
     try:
         account = InstagramAccount.objects.get(instagram_user_id=instagram_account_id)
     except InstagramAccount.DoesNotExist:
         logger.warning("InstagramAccount not found: %s", instagram_account_id)
-        # We can't create a ProcessedComment with a FK to a non-existent account,
-        # so we log and return a transient (unsaved) failed stub.
-        # Per requirements 7.2: mark failed, return success response.
         return _make_stub_failed_comment(
             comment_id=comment_id,
             media_id=media_id,
@@ -97,7 +103,7 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
             error=f"InstagramAccount has no access token: {instagram_account_id}",
         )
 
-    # ── Create the ProcessedComment record now that we have a valid account ───
+    # ── 3. Atomic create-or-get ───────────────────────────────────────────────
     record, created = ProcessedComment.objects.get_or_create(
         instagram_comment_id=comment_id,
         defaults={
@@ -110,11 +116,15 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
         },
     )
     if not created:
-        # Race condition: another worker created it between our initial check and now
-        logger.info("Duplicate comment (race) %s — returning existing record", comment_id)
-        return record
+        if record.is_terminal:
+            logger.info(
+                "Duplicate comment (race) %s — already terminal (%s)",
+                comment_id, record.status,
+            )
+            return record
+        logger.info("Reprocessing comment %s (status=%s)", comment_id, record.status)
 
-    # ── 3. Price intent check ─────────────────────────────────────────────────
+    # ── 4. Price intent check ─────────────────────────────────────────────────
     if not is_price_inquiry(comment_text):
         record.status = ProcessedComment.STATUS_IGNORED
         record.processed_at = dj_timezone.now()
@@ -122,9 +132,11 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
         logger.info("Comment %s is not a price inquiry — ignored", comment_id)
         return record
 
-    # ── 4. Resolve post mapping → product ────────────────────────────────────
+    # ── 5. Resolve post mapping → product ────────────────────────────────────
     try:
-        mapping = InstagramPostProductMapping.objects.select_related("product__business").get(
+        mapping = InstagramPostProductMapping.objects.select_related(
+            "product__business"
+        ).get(
             instagram_account=account,
             instagram_media_id=media_id,
         )
@@ -143,10 +155,8 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
         record.error_message = f"Product {product.pk} is inactive"
         record.processed_at = dj_timezone.now()
         record.save(update_fields=["status", "error_message", "processed_at"])
-        logger.warning("Product %s inactive", product.pk)
         return record
 
-    # Cross-business isolation (Requirement 8.5)
     if product.business_id != account.business_id:
         record.status = ProcessedComment.STATUS_FAILED
         record.error_message = (
@@ -154,17 +164,14 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
         )
         record.processed_at = dj_timezone.now()
         record.save(update_fields=["status", "error_message", "processed_at"])
-        logger.warning(
-            "Cross-business product isolation: product.business=%s account.business=%s",
-            product.business_id,
-            account.business_id,
-        )
         return record
 
-    # ── 5. Compose reply ──────────────────────────────────────────────────────
+    # ── 6. Compose and persist reply text BEFORE calling Meta ─────────────────
     reply_text = build_price_reply(product)
+    record.reply_text = reply_text
+    record.save(update_fields=["reply_text"])
 
-    # ── 6. Send private reply ─────────────────────────────────────────────────
+    # ── 7. Send private reply ─────────────────────────────────────────────────
     client = MetaPrivateReplyClient()
     result = client.send_private_reply(
         comment_id=comment_id,
@@ -173,17 +180,87 @@ def process_comment_event(event_data: dict) -> ProcessedComment:
         page_id=account.page_id,
     )
 
-    # ── 7. Update status ──────────────────────────────────────────────────────
+    # ── 8. Handle result ──────────────────────────────────────────────────────
+    now = dj_timezone.now()
+
     if result.success:
         record.status = ProcessedComment.STATUS_SENT
-        record.reply_text = reply_text
+        record.processed_at = now
+        record.save(update_fields=["status", "processed_at"])
+        logger.info("Comment %s replied successfully (message_id=%s)", comment_id, result.message_id)
+        return record
+
+    # Save structured error diagnostics
+    record.error_message = result.error or "Unknown Meta API error"
+    record.meta_error_code = result.error_code
+    record.meta_error_subcode = result.error_subcode
+    record.meta_fbtrace_id = result.fbtrace_id or ""
+
+    if result.already_replied:
+        # Meta says this comment already has a reply — reconcile with remote state
+        record = _reconcile_already_replied(record, comment_id, reply_text, account, client, now)
     else:
         record.status = ProcessedComment.STATUS_FAILED
-        record.error_message = result.error or "Unknown Meta API error"
+        record.processed_at = now
+        record.save(update_fields=[
+            "status", "error_message", "meta_error_code",
+            "meta_error_subcode", "meta_fbtrace_id", "processed_at",
+        ])
+        logger.error(
+            "Comment %s failed (retryable=%s): %s",
+            comment_id, result.retryable, result.error,
+        )
 
-    record.processed_at = dj_timezone.now()
-    record.save(update_fields=["status", "reply_text", "error_message", "processed_at"])
+    return record
 
+
+def _reconcile_already_replied(
+    record: ProcessedComment,
+    comment_id: str,
+    intended_reply: str,
+    account,
+    client: MetaPrivateReplyClient,
+    now,
+) -> ProcessedComment:
+    """
+    Meta returned 'already has a reply'. Try to verify the remote reply matches
+    what we intended. Either way, mark the record as already_replied — never
+    post again.
+    """
+    logger.info(
+        "Comment %s already has a remote reply — reconciling local record", comment_id
+    )
+
+    # Attempt to retrieve existing replies
+    replies = client.get_comment_replies(comment_id, account.access_token)
+
+    matched = False
+    if replies:
+        account_ig_id = account.instagram_user_id
+        for reply in replies:
+            from_id = (reply.get("from") or {}).get("id", "")
+            reply_message = reply.get("message", "")
+            if from_id == account_ig_id and reply_message.strip() == intended_reply.strip():
+                matched = True
+                break
+
+    if matched:
+        logger.info(
+            "Comment %s: remote reply matches intended text — marking sent", comment_id
+        )
+        record.status = ProcessedComment.STATUS_SENT
+        record.error_message = "Reply confirmed via reconciliation (already existed remotely)"
+    else:
+        logger.info(
+            "Comment %s: could not verify remote reply — marking already_replied", comment_id
+        )
+        record.status = ProcessedComment.STATUS_ALREADY_REPLIED
+
+    record.processed_at = now
+    record.save(update_fields=[
+        "status", "error_message", "meta_error_code",
+        "meta_error_subcode", "meta_fbtrace_id", "processed_at",
+    ])
     return record
 
 
@@ -200,10 +277,9 @@ def _make_stub_failed_comment(
 ) -> ProcessedComment:
     """
     Return an unsaved ProcessedComment stub when we cannot link to a real
-    InstagramAccount (account not found / inactive). The record is intentionally
-    NOT persisted so the FK constraint is not violated.
+    InstagramAccount. NOT persisted — FK constraint would be violated.
     """
-    stub = ProcessedComment(
+    return ProcessedComment(
         instagram_comment_id=comment_id,
         instagram_media_id=media_id,
         commenter_id=commenter_id or "",
@@ -212,4 +288,3 @@ def _make_stub_failed_comment(
         error_message=error,
         received_at=received_at,
     )
-    return stub

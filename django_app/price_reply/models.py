@@ -73,13 +73,18 @@ class ProcessedComment(models.Model):
     STATUS_IGNORED = "ignored"
     STATUS_SENT = "sent"
     STATUS_FAILED = "failed"
+    STATUS_ALREADY_REPLIED = "already_replied"
 
     STATUS_CHOICES = [
         (STATUS_RECEIVED, "Received"),
         (STATUS_IGNORED, "Ignored"),
         (STATUS_SENT, "Sent"),
         (STATUS_FAILED, "Failed"),
+        (STATUS_ALREADY_REPLIED, "Already Replied"),
     ]
+
+    # Terminal statuses — no further processing needed
+    TERMINAL_STATUSES = {STATUS_IGNORED, STATUS_SENT, STATUS_ALREADY_REPLIED}
 
     instagram_account = models.ForeignKey(
         InstagramAccount,
@@ -97,9 +102,17 @@ class ProcessedComment(models.Model):
     )
     reply_text = models.TextField(blank=True)
     error_message = models.TextField(blank=True)
+    # Structured Meta error diagnostics
+    meta_error_code = models.IntegerField(null=True, blank=True)
+    meta_error_subcode = models.IntegerField(null=True, blank=True)
+    meta_fbtrace_id = models.CharField(max_length=255, blank=True)
     received_at = models.DateTimeField()
     processed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Comment {self.instagram_comment_id} [{self.status}]"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in self.TERMINAL_STATUSES
