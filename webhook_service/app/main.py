@@ -61,6 +61,12 @@ async def receive_webhook(request: Request) -> JSONResponse:
         return JSONResponse(status_code=200, content={"status": "ok"})
 
     logger.info("Received webhook payload with %d entries", len(payload.get("entry", [])))
+    # Debug: log the full payload structure (sanitized)
+    logger.info("Webhook payload structure: object=%s, entry_count=%d", 
+                payload.get("object"), len(payload.get("entry", [])))
+    for i, entry in enumerate(payload.get("entry", [])):
+        logger.info("Entry[%d]: id=%s, time=%s, changes_count=%d", 
+                   i, entry.get("id"), entry.get("time"), len(entry.get("changes", [])))
 
     # Extract comment events (Requirements 3.1, 3.2)
     events = extract_comment_events(payload)

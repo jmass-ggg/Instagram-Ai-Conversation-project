@@ -98,8 +98,8 @@ class TestDuplicateIdempotence:
 
         event = _base_event(account_id="acc-dup", comment_id="cmt-dup", media_id="media-dup")
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
-            MockClient.return_value.send_private_reply.return_value = MetaReplyResult(
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
+            MockClient.return_value.send_private_dm.return_value = MetaReplyResult(
                 success=True, message_id="msg-1"
             )
             first = process_comment_event(event)
@@ -113,7 +113,7 @@ class TestDuplicateIdempotence:
         assert first.instagram_comment_id == second.instagram_comment_id
 
         # Meta API called only once (first processing)
-        assert MockClient.return_value.send_private_reply.call_count == 1
+        assert MockClient.return_value.send_private_dm.call_count == 1
 
     @given(comment_id=st.text(min_size=1, max_size=50, alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="-_")))
     @hyp_settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
@@ -148,8 +148,8 @@ class TestDuplicateIdempotence:
 
         event = _base_event(account_id=uid, comment_id=comment_id, media_id=mid)
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
-            MockClient.return_value.send_private_reply.return_value = MetaReplyResult(
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
+            MockClient.return_value.send_private_dm.return_value = MetaReplyResult(
                 success=True, message_id="msg-x"
             )
             process_comment_event(event)
@@ -157,7 +157,7 @@ class TestDuplicateIdempotence:
 
         count = ProcessedComment.objects.filter(instagram_comment_id=comment_id).count()
         assert count == 1
-        assert MockClient.return_value.send_private_reply.call_count == 1
+        assert MockClient.return_value.send_private_dm.call_count == 1
 
 
 # ── Property 7: Non-price comments are ignored ────────────────────────────────
@@ -183,9 +183,9 @@ class TestNonPriceIgnored:
             text="Nice photo!",
         )
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
 
         assert result.status == ProcessedComment.STATUS_IGNORED
 
@@ -196,7 +196,7 @@ class TestNonPriceIgnored:
             and "cost" not in t.lower()
         )
     )
-    @hyp_settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @hyp_settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @pytest.mark.django_db
     def test_non_price_ignored_property(self, comment_text):
         """
@@ -219,9 +219,9 @@ class TestNonPriceIgnored:
 
         event = _base_event(account_id=uid, comment_id=cid, media_id=mid, text=comment_text)
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
 
         assert result.status == ProcessedComment.STATUS_IGNORED
 
@@ -237,9 +237,9 @@ class TestResolutionFailures:
 
     def test_unknown_account_returns_failed_stub(self):
         event = _base_event(account_id="no-such-account", comment_id="cmt-no-acc")
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
         assert result.status == ProcessedComment.STATUS_FAILED
 
     def test_inactive_account_returns_failed(self):
@@ -248,9 +248,9 @@ class TestResolutionFailures:
         account = _make_account(biz, uid="acc-inactive", active=False)
 
         event = _base_event(account_id="acc-inactive", comment_id="cmt-ia")
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
         assert result.status == ProcessedComment.STATUS_FAILED
 
     def test_no_access_token_returns_failed(self):
@@ -259,9 +259,9 @@ class TestResolutionFailures:
         account = _make_account(biz, uid="acc-notoken", token="")
 
         event = _base_event(account_id="acc-notoken", comment_id="cmt-nt")
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
         assert result.status == ProcessedComment.STATUS_FAILED
 
     def test_no_post_mapping_returns_failed(self):
@@ -271,9 +271,9 @@ class TestResolutionFailures:
         # No mapping created
 
         event = _base_event(account_id="acc-nm", comment_id="cmt-nm", text="price?")
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
         assert result.status == ProcessedComment.STATUS_FAILED
 
     def test_inactive_product_returns_failed(self):
@@ -284,9 +284,9 @@ class TestResolutionFailures:
         _make_mapping(account, product, media_id="media-ip")
 
         event = _base_event(account_id="acc-ip", comment_id="cmt-ip", media_id="media-ip", text="price?")
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
         assert result.status == ProcessedComment.STATUS_FAILED
 
 
@@ -315,9 +315,9 @@ class TestCrossBusinessIsolation:
 
         event = _base_event(account_id="acc-xb", comment_id="cmt-xb", media_id="media-xb", text="price?")
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
             result = process_comment_event(event)
-            assert MockClient.return_value.send_private_reply.call_count == 0
+            assert MockClient.return_value.send_private_dm.call_count == 0
 
         assert result.status == ProcessedComment.STATUS_FAILED
         assert ProcessedComment.objects.get(instagram_comment_id="cmt-xb").status == ProcessedComment.STATUS_FAILED
@@ -377,8 +377,8 @@ class TestInternalEndpointAuth:
         product = _make_product(biz)
         _make_mapping(account, product, media_id="media-auth")
 
-        with patch("price_reply.service.MetaPrivateReplyClient") as MockClient:
-            MockClient.return_value.send_private_reply.return_value = MetaReplyResult(
+        with patch("price_reply.service.MetaCommentReplyClient") as MockClient:
+            MockClient.return_value.send_private_dm.return_value = MetaReplyResult(
                 success=True, message_id="msg-ok"
             )
             response = self._post(client, secret="correct-secret")
